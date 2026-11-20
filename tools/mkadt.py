@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--device sweet|violet]
 """
 import hashlib, os, struct, sys
 
@@ -39,6 +39,18 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# Per-device facts. sweet = Redmi Note 10 Pro (SM7150, UFS); violet = Redmi Note 7 Pro (SM6150, eMMC). The violet values are
+# the output of devices/violet/tools/dtb-survey.py --sweet-constants on a real violet DTB plus its /proc/cmdline.
+DEVICES = {
+    'sweet': dict(fb=(FB, FB_SIZE), fb_wh=(1080, 2400), ufs=(UFS, UFS_SIZE),
+                  high=(HIGH_PHYS_BASE, HIGH_MEM_SIZE), mhz=(1804800000, 2304000000), ecid=SWEET_ECID,
+                  ),
+    'violet': dict(fb=(0x9c000000, 0x00f00000), fb_wh=(1080, 2340), ufs=None, emmc=(0x7c4000, 0x1000),       # eMMC (7c4000.sdhci): no UFS node
+                   high=(0x100000000, 0x7dd00000),                                  # upper DDR bank, ~1.96 GiB
+                   mhz=(1708800000, 2016000000), ecid=0x56494f4c45540001),          # Kryo 460 Silver/Gold max (informational)
+}
+DEVICE = 'sweet'
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -74,9 +86,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, device='sweet'):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    dev = DEVICES[device]
+    phys_base, mem_size = dev['high'] if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
     mem_size -= PANIC_LOG_SIZE
@@ -111,7 +124,7 @@ def build(seed=None, qemu=False, highmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', dev['ecid'])),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -149,7 +162,7 @@ def build(seed=None, qemu=False, highmem=False):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('clock-frequency', u32(dev['mhz'][1] if core >= 6 else dev['mhz'][0])),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -191,18 +204,26 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(*dev['fb'])),
+        ('width', u32(dev['fb_wh'][0])),
+        ('height', u32(dev['fb_wh'][1])),
+        ('stride', u32(dev['fb_wh'][0] * 4)),   # a8r8g8b8; ABL's actual stride is to be confirmed on violet
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+    # (device with eMMC, i.e. violet: no node at all, so that the kernel never maps a UFS block the phone does not use)
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
-    ])
+        ('reg', u64(*dev['ufs'])),
+    ]) if dev['ufs'] else None
+
+    # bsd/dev/sweet_emmc.c: eMMC SDHCI host (violet only; absolute physical reg).
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
+        ('reg', u64(*dev['emmc'])),
+    ]) if dev.get('emmc') else None
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -231,18 +252,19 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + (cstr('xiaomi,violet') + cstr('qcom,sm6150') if device == 'violet' else cstr('qcom,sm7150')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu or ufs is None else [ufs]) + ([] if qemu or emmc is None else [emmc]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    device = sys.argv[sys.argv.index('--device') + 1] if '--device' in sys.argv else 'sweet'
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
